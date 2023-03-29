@@ -51,7 +51,8 @@ class ActorNetwork(nn.Module):
         nn.init.xavier_normal_(self.cConv1d.weight.data)
         nn.init.constant_(self.cConv1d.bias.data, 0.0)
 
-    def forward(self, inputs):
+    def forward(self, inputs):  # state_batch
+        # 当前码率/最高码率， 缓存时长/10秒， 下载速度 = 当前播放chunk大小/下载耗时， 下载耗时/10秒， 下一个chunk的各码率的大小list， 余留chunk个数/总chunk个数
 
         bitrateFcOut = F.relu(self.bitrateFc(inputs[:, 0:1, -1]), inplace=True)
 
@@ -128,8 +129,9 @@ class CriticNetwork(nn.Module):
         nn.init.xavier_normal_(self.cConv1d.weight.data)
         nn.init.constant_(self.cConv1d.bias.data, 0.0)
 
-    def forward(self, inputs):
-
+    def forward(self, inputs):  # state_batch
+        # 当前码率/最高码率， 缓存时长/10秒， 下载速度 = 当前播放chunk大小/下载耗时， 下载耗时/10秒， 下一个chunk的各码率的大小list， 余留chunk个数/总chunk个数
+        
         bitrateFcOut = F.relu(self.bitrateFc(inputs[:, 0:1, -1]), inplace=True)
 
         bufferFcOut = F.relu(self.bufferFc(inputs[:, 1:2, -1]), inplace=True)

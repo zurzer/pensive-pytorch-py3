@@ -11,7 +11,8 @@ from A3C import A3C
 from datetime import datetime
 
 
-# bit_rate, buffer_size, next_chunk_size, bandwidth_measurement(throughput and time), chunk_til_video_end
+# 当前码率/最高码率， 缓存时长/10秒， 下载速度 = 当前播放chunk大小/下载耗时， 下载耗时/10秒， 下一个chunk的各码率的大小list， 余留chunk个数/总chunk个数
+# bit_rate, buffer_size, down_speed, down_time, next_down_chunk_size_list, chunk_remain
 STATE_INFO = 6  # 状态值的个数
 STATE_LEN = 8  # take how many frames in the past  用于算法判断的历史状态个数
 ACTION_DIM = 6  # 可选码率个数
