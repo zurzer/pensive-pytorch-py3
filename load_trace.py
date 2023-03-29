@@ -23,8 +23,8 @@ def load_trace(cooked_trace_folder=COOKED_TRACE_FOLDER):
             with open(file_path, 'rb') as f:  # 添加： 时刻 网速
                 for line in f:
                     parse = line.split()
-                    cooked_time.append(float(parse[0]))
-                    cooked_bw.append(float(parse[1]))
+                    cooked_time.append(float(parse[0]))  # s
+                    cooked_bw.append(float(parse[1]))  # mbps
             all_cooked_time.append(cooked_time)
             all_cooked_bw.append(cooked_bw)
             all_file_names.append(cooked_file)  # 文件（夹）名，未使用

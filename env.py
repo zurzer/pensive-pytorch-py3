@@ -4,17 +4,22 @@ MILLISECONDS_IN_SECOND = 1000.0
 B_IN_MB = 1000000.0
 BITS_IN_BYTE = 8.0
 RANDOM_SEED = 42
-VIDEO_CHUNCK_LEN = 4000.0  # millisec, every time add this amount to buffer  固定每个分段时长
+# VIDEO_CHUNCK_LEN = 4000.0  # millisec, every time add this amount to buffer  固定每个分段时长
 BITRATE_LEVELS = 6  # 可选码率个数
 TOTAL_VIDEO_CHUNCK = 48  # 总分段个数
-BUFFER_THRESH = 60.0 * MILLISECONDS_IN_SECOND  # millisec, max buffer limit  触发下载休眠的最大缓存量
+BUFFER_THRESH = 600.0 * MILLISECONDS_IN_SECOND  # millisec, max buffer limit  触发下载休眠的最大缓存量
+RESTART_BUFFER_THRESH = 100.0 * MILLISECONDS_IN_SECOND
+CDN_BUFFER_THRESH = 50.0 * MILLISECONDS_IN_SECOND
+CDN_RESTART_BUFFER_THRESH = 30.0 * MILLISECONDS_IN_SECOND
 DRAIN_BUFFER_SLEEP_TIME = 500.0  # millisec  每次休眠时长
+PIECE_DURATION_TIME = 500.0  # millisec  每次子分片视频时长，下载满500ms就能推给播放器开始播放，无需等待完整分段下载完毕
 PACKET_PAYLOAD_PORTION = 0.95  # 网速有效载荷
 LINK_RTT = 80  # millisec  连接耗时
 PACKET_SIZE = 1500  # bytes
 NOISE_LOW = 0.9  # 下载耗时波动率下限
 NOISE_HIGH = 1.1  # 下载耗时波动率上限
-VIDEO_SIZE_FILE = './data/video_size_'  # 分段大小文件
+VIDEO_SIZE_FILE = './qdata/video_size_'  # 分段大小文件 BYTE
+VIDEO_DURATION_FILE = './qdata/video_duration'  # 分段时长文件 s
 
 
 class Environment:
@@ -40,80 +45,135 @@ class Environment:
         self.mahimahi_ptr = np.random.randint(1, len(self.cooked_bw))  # 随机算一个网速列表开始时刻idx
         self.last_mahimahi_time = self.cooked_time[self.mahimahi_ptr - 1]  # 上一个时刻，算时间间隔
 
+        self.video_duration = []  # in ms
+        with open(VIDEO_DURATION_FILE) as f:
+            for line in f:
+                self.video_duration.append(int(float(line.strip()) * 1000))  # ms，码率对应的分段文件时长，老算法下每个分段为固定长度VIDEO_CHUNCK_LEN=4s
+
         self.video_size = {}  # in bytes
         for bitrate in range(BITRATE_LEVELS):  # 第几档码率，INT
             self.video_size[bitrate] = []
             with open(VIDEO_SIZE_FILE + str(bitrate)) as f:
                 for line in f:
-                    self.video_size[bitrate].append(int(line.split()[0]))  # 码率对应的分段文件大小，每个分段固定长度VIDEO_CHUNCK_LEN=4s
+                    self.video_size[bitrate].append(int(line.strip()))  # byte，码率对应的分段文件大小
 
-    def get_video_chunk(self, quality):  # quality：INT第几档码率，下载完当前chunk就返回，TODO：码率档位可能不够
+    def get_video_chunk(self, quality):  # quality：INT第几档码率，下载完当前chunk就返回，TODO：可能缺失部分码率档位
 
         assert quality >= 0
         assert quality < BITRATE_LEVELS
 
-        video_chunk_size = self.video_size[quality][self.video_chunk_counter]  # 分段大小
+        video_chunk_size = self.video_size[quality][self.video_chunk_counter]  # byte，分段大小
+        video_chunk_duration = self.video_duration[self.video_chunk_counter]  # ms，分段时长
+        video_piece_size = video_chunk_size * PIECE_DURATION_TIME / video_chunk_duration
 
         # use the delivery opportunity in mahimahi
-        delay = 0.0  # in ms  下载耗时
+        total_delay = 0.0  # in ms  下载耗时
+        total_rebuf = 0.0  # in ms  下载耗时
         video_chunk_counter_sent = 0  # in bytes  已经发给播放器的大小
-
+        
         while True:  # download video chunk over mahimahi
             # 速度 和 当前速度区间的间隔时长，TODO：当前没有下载速度怎么处理
-            throughput = self.cooked_bw[self.mahimahi_ptr] \
-                * B_IN_MB / BITS_IN_BYTE
-            duration = self.cooked_time[self.mahimahi_ptr] \
-                - self.last_mahimahi_time
+            throughput = self.cooked_bw[self.mahimahi_ptr] * B_IN_MB / BITS_IN_BYTE  # mbps 转 byte/s
+            duration = self.cooked_time[self.mahimahi_ptr] - self.last_mahimahi_time  # s
 
-            packet_payload = throughput * duration * PACKET_PAYLOAD_PORTION  # 下载大小
+            piece_size = min(video_piece_size, video_chunk_size - video_chunk_counter_sent)  # byte，子分片下载大小
+            piece_duration = video_chunk_duration * piece_size / video_chunk_size  # ms，子分片的视频时长，<=PIECE_DURATION_TIME
 
-            if video_chunk_counter_sent + packet_payload > video_chunk_size:  # 当前分段会在本速度区间下载完毕
-                # 实际下载耗时
-                fractional_time = (video_chunk_size - video_chunk_counter_sent) / \
-                    throughput / PACKET_PAYLOAD_PORTION
-                delay += fractional_time  # 下载耗时
-                self.last_mahimahi_time += fractional_time  # 结束时刻
-                assert (self.last_mahimahi_time <= self.cooked_time[self.mahimahi_ptr])
-                break
+            packet_payload = throughput * duration * PACKET_PAYLOAD_PORTION  # byte，下载大小
+
+            if packet_payload > piece_size:
+                duration = piece_size / throughput / PACKET_PAYLOAD_PORTION  # s，实际下载耗时
+                packet_payload = piece_size
+            else:
+                self.last_mahimahi_time = self.cooked_time[self.mahimahi_ptr]  # 结束时刻
+                self.mahimahi_ptr += 1  # 进入下一个速度区间
+
+                if self.mahimahi_ptr >= len(self.cooked_bw):  # 循环速度文件
+                    # loop back in the beginning
+                    # note: trace file starts with time 0
+                    self.mahimahi_ptr = 1  # idx为0的话，获取不到此刻速度区间的耗时，速度列表文件第一个速度值需要丢弃，保留第一个时刻值
+                    self.last_mahimahi_time = 0
 
             video_chunk_counter_sent += packet_payload  # 下载的数据发给播放器
-            delay += duration  # 下载耗时
-            self.last_mahimahi_time = self.cooked_time[self.mahimahi_ptr]  # 结束时刻
-            self.mahimahi_ptr += 1  # 进入下一个速度区间
+            delay += duration  # s，下载耗时
+            self.last_mahimahi_time += duration
+            assert (self.last_mahimahi_time <= self.cooked_time[self.mahimahi_ptr])
 
-            if self.mahimahi_ptr >= len(self.cooked_bw):  # 循环速度文件
-                # loop back in the beginning
-                # note: trace file starts with time 0
-                self.mahimahi_ptr = 1  # idx为0的话，获取不到此刻速度区间的耗时，速度列表文件第一个速度值需要丢弃，保留第一个时刻值
-                self.last_mahimahi_time = 0
+            delay *= MILLISECONDS_IN_SECOND
+            delay += LINK_RTT  # 下载耗时加连接耗时
+            
+            # add a multiplicative noise to the delay
+            delay *= np.random.uniform(NOISE_LOW, NOISE_HIGH)  # 下载耗时叠加波动率
 
-        delay *= MILLISECONDS_IN_SECOND
-        delay += LINK_RTT  # 下载耗时加连接耗时
+            # rebuffer time
+            if self.video_chunk_counter > 0 or video_chunk_counter_sent > piece_size:  # DONE：首次开播无缓存时的piece不计入卡顿
+                total_rebuf += np.maximum(delay - self.buffer_size, 0.0)  # 卡顿时长，当前分段下载耗时 减去 已有缓存时长，DONE：不再认为一个分段下载完毕才能去播放，导致开播的时候一定会卡顿
 
-    # add a multiplicative noise to the delay
-        delay *= np.random.uniform(NOISE_LOW, NOISE_HIGH)  # 下载耗时叠加波动率
-        # rebuffer time
-        rebuf = np.maximum(delay - self.buffer_size, 0.0)  # 卡顿时长，当前分段下载耗时 减去 已有缓存时长，TODO：认为一个分段下载完毕才能去播放，导致开播的时候一定会卡顿
+            # update the buffer
+            self.buffer_size = np.maximum(self.buffer_size - delay, 0.0)  # 已有缓存时长，减去 下载耗时，余留缓存时长
 
-        # update the buffer
-        self.buffer_size = np.maximum(self.buffer_size - delay, 0.0)  # 已有缓存时长，减去 下载耗时，余留缓存时长
+            # add in the new chunk
+            # self.buffer_size += VIDEO_CHUNCK_LEN  # 缓存时长，加上 分段时长
+            # self.buffer_size += video_chunk_duration  # 缓存时长，加上 分段时长，DONE：固定值改为变动值
+            self.buffer_size += piece_duration  # 缓存时长，加上 分片时长，DONE：使用更小粒度的小分片计算卡顿时长
 
-        # add in the new chunk
-        self.buffer_size += VIDEO_CHUNCK_LEN  # 缓存时长，加上 分段时长，TODO：固定值改为变动值
+            total_delay += delay
+            if video_chunk_counter_sent >= video_chunk_size:  # 当前分段会在本速度区间下载完毕
+                break
+
+    #     while True:  # download video chunk over mahimahi
+    #         # 速度 和 当前速度区间的间隔时长
+    #         throughput = self.cooked_bw[self.mahimahi_ptr] * B_IN_MB / BITS_IN_BYTE
+    #         duration = self.cooked_time[self.mahimahi_ptr] - self.last_mahimahi_time
+
+    #         packet_payload = throughput * duration * PACKET_PAYLOAD_PORTION  # 下载大小
+
+    #         if video_chunk_counter_sent + packet_payload > video_chunk_size:  # 当前分段会在本速度区间下载完毕
+    #             # 实际下载耗时
+    #             fractional_time = (video_chunk_size - video_chunk_counter_sent) / throughput / PACKET_PAYLOAD_PORTION
+    #             delay += fractional_time  # 下载耗时
+    #             self.last_mahimahi_time += fractional_time  # 结束时刻
+    #             assert (self.last_mahimahi_time <= self.cooked_time[self.mahimahi_ptr])
+    #             break
+
+    #         video_chunk_counter_sent += packet_payload  # 下载的数据发给播放器
+    #         delay += duration  # 下载耗时
+    #         self.last_mahimahi_time = self.cooked_time[self.mahimahi_ptr]  # 结束时刻
+    #         self.mahimahi_ptr += 1  # 进入下一个速度区间
+
+    #         if self.mahimahi_ptr >= len(self.cooked_bw):  # 循环速度文件
+    #             # loop back in the beginning
+    #             # note: trace file starts with time 0
+    #             self.mahimahi_ptr = 1  # idx为0的话，获取不到此刻速度区间的耗时，速度列表文件第一个速度值需要丢弃，保留第一个时刻值
+    #             self.last_mahimahi_time = 0
+
+    #     delay *= MILLISECONDS_IN_SECOND
+    #     delay += LINK_RTT  # 下载耗时加连接耗时
+
+    # # add a multiplicative noise to the delay
+    #     delay *= np.random.uniform(NOISE_LOW, NOISE_HIGH)  # 下载耗时叠加波动率
+    #     # rebuffer time
+    #     rebuf = np.maximum(delay - self.buffer_size, 0.0)  # 卡顿时长，当前分段下载耗时 减去 已有缓存时长
+
+    #     # update the buffer
+    #     self.buffer_size = np.maximum(self.buffer_size - delay, 0.0)  # 已有缓存时长，减去 下载耗时，余留缓存时长
+
+    #     # add in the new chunk
+    #     # self.buffer_size += VIDEO_CHUNCK_LEN  # 缓存时长，加上 分段时长
+    #     self.buffer_size += video_chunk_duration  # 缓存时长，加上 分段时长，DONE：固定值改为变动值
 
         # sleep if buffer gets too large
         sleep_time = 0  # 下载休眠时长
-        if self.buffer_size > BUFFER_THRESH:  # 缓存过大触发下载休眠，TODO：进入和退出休眠用不同的值
+        if self.buffer_size > BUFFER_THRESH:  # 缓存过大触发下载休眠，DONE：进入和退出休眠用不同的值
             # exceed the buffer limit
             # we need to skip some network bandwidth here
             # but do not add up the delay
-            drain_buffer_time = self.buffer_size - BUFFER_THRESH  # 多出的过大缓存量
+            drain_buffer_time = self.buffer_size - RESTART_BUFFER_THRESH  # 到退出休眠模式时，多出的过大缓存量
             sleep_time = np.ceil(drain_buffer_time / DRAIN_BUFFER_SLEEP_TIME) * DRAIN_BUFFER_SLEEP_TIME  # 下载休眠时长
             self.buffer_size -= sleep_time  # 下载休眠期间消耗的缓存时长
 
             while True:
-                duration = self.cooked_time[self.mahimahi_ptr] \
-                    - self.last_mahimahi_time
+                duration = self.cooked_time[self.mahimahi_ptr] - self.last_mahimahi_time
                 if duration > sleep_time / MILLISECONDS_IN_SECOND:  # 跳过休眠期间的网速列表
                     self.last_mahimahi_time += sleep_time / MILLISECONDS_IN_SECOND  # 修改上次网速结束时间点 匹配 休眠结束时间点
                     break
@@ -158,10 +218,10 @@ class Environment:
             next_video_chunk_sizes.append(self.video_size[i][self.video_chunk_counter])  # 下一个分段的各码率的大小
 
         # 下载耗时，休眠时长，缓存时长，卡顿时长，当前播放chunk大小，下一个chunk的各码率的大小，播放是否结束，余留chunk个数
-        return delay, \
+        return total_delay, \
             sleep_time, \
             return_buffer_size / MILLISECONDS_IN_SECOND, \
-            rebuf / MILLISECONDS_IN_SECOND, \
+            total_rebuf / MILLISECONDS_IN_SECOND, \
             video_chunk_size, \
             next_video_chunk_sizes, \
             end_of_video, \
@@ -178,6 +238,6 @@ class Environment:
 
         # randomize the start point of the trace
         # note: trace file starts with time 0
-        # 选择网速列表的起始idx，TODO：ptrIndex需要>0
-        self.mahimahi_ptr = ptrIndex % len(self.cooked_bw)
+        # 选择网速列表的起始idx，DONE：ptrIndex需要>0
+        self.mahimahi_ptr = max(1, ptrIndex % len(self.cooked_bw))
         self.last_mahimahi_time = self.cooked_time[self.mahimahi_ptr - 1]
