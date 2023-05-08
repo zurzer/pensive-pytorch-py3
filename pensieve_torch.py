@@ -19,25 +19,31 @@ ACTION_DIM = 6  # 可选码率个数
 ACTOR_LR_RATE = 0.0001  # 演员训练学习率
 CRITIC_LR_RATE = 0.001  # 观察家训练学习率
 NUM_AGENTS = 4  # 演员个数
-TRAIN_SEQ_LEN = 100  # take as a train batch  最多一次进行100个chunk的播放训练
+TRAIN_SEQ_LEN = 1000  # take as a train batch  最多一次进行100个chunk的播放训练
 MODEL_SAVE_INTERVAL = 100  # 每100次保存一下模型参数
-VIDEO_BIT_RATE = [300, 750, 1200, 1850, 2850, 4300]  # Kbps  可选码率列表
-# VIDEO_BIT_RATE = [500, 850, 1200, 1850, 0, 0]
+# VIDEO_BIT_RATE = [300, 750, 1200, 1850, 2850, 4300]  # Kbps  可选码率列表
+VIDEO_BIT_RATE = [200, 380, 600, 900, 1600, 4000]  # kbps
 # HD_REWARD = [1, 2, 3, 12, 15, 20]  # 激励函数，码率转化为梯度的激励值
-BUFFER_NORM_FACTOR = 10.0  # 缓存时长归一化分母
-CHUNK_TIL_VIDEO_END_CAP = 48.0  # chunk位置idx归一化分母
+BUFFER_NORM_FACTOR = 600.0  # 缓存时长归一化分母
+BANDWIDTH_NORM_FACTOR = 10.0  # 速度归一化分母 10MB/s
+CHUNK_TIL_VIDEO_END_CAP = 720.0  # chunk位置idx归一化分母
 M_IN_K = 1000.0
-REBUF_PENALTY = 4.3  # 1 sec rebuffering -> 3 Mbps  卡顿惩罚系数
-SMOOTH_PENALTY = 1  # 码率平滑度，码率切换惩罚系数
+# REBUF_PENALTY = 5.0  # 1 sec rebuffering  卡顿惩罚系数
+REBUF_PENALTYS = [0, 0.2, 0.5, 1.0, 2.0, 4.0]  # 卡顿惩罚系数，不同分辨率不同系数
+SMOOTH_DOWN_PENALTY = 0.8  # 码率平滑度，码率下切惩罚系数
+SMOOTH_UP_PENALTY = 0.2  # 码率平滑度，码率上切惩罚系数
 DEFAULT_QUALITY = 1  # default video quality without agent  默认起始码率
 RANDOM_SEED = 42  # 随机数初始化种子
 # RAND_RANGE = 1000
 
-SUMMARY_DIR = './results'
+# log_central  Epoch: {epoch}, Avg_reward: {avg_reward}, Avg_entropy: {avg_entropy}
+# log_agent_N  {time_stamp}\t{VIDEO_BIT_RATE[bit_rate]}\t{buffer_size}\t{rebuf}\t{video_chunk_size}\t{delay}\t{reward}\n
+# log_test  {epoch}\t{rewards_min}\t{rewards_5per}\t{rewards_mean}\t{rewards_median}\t{rewards_95per}\t{rewards_max}\n
 LOG_FILE = './results/log'
-TEST_LOG_FOLDER = './test_results/'
-# TRAIN_TRACES = './data/cooked_traces/'
-TRAIN_TRACES = './dataset/video_trace/'
+# log_sim_rl_N  {time_stamp / M_IN_K}\t{VIDEO_BIT_RATE[bit_rate]}\t{buffer_size}\t{rebuf}\t{video_chunk_size}\t{delay}\t{reward}\n
+TEST_LOG_FOLDER = './results/test/'
+SUMMARY_DIR = './results'
+TRAIN_TRACES = './qdata/network_trace/train/'
 
 CRITIC_MODEL = None  # 不保存中间结果的观察家训练参数
 # CRITIC_MODEL= './results/critic.pt'
@@ -200,11 +206,10 @@ def agent(agent_id, all_cooked_time, all_cooked_bw, net_params_queue, exp_queue,
 
                 # 行方向，各行的横向最后一列赋值
                 state[0, 0, -1] = VIDEO_BIT_RATE[bit_rate] / float(np.max(VIDEO_BIT_RATE))  # last quality  归一化，当前码率/最高码率
-                state[0, 1, -1] = buffer_size / BUFFER_NORM_FACTOR  # 10 sec  缓存时长/10秒
-                # kilo byte / ms  下载速度 = 当前播放chunk大小/下载耗时
-                state[0, 2, -1] = float(video_chunk_size) / float(delay) / M_IN_K
-                state[0, 3, -1] = float(delay) / M_IN_K / BUFFER_NORM_FACTOR  # 10 sec  下载耗时/10秒
-                state[0, 4, :ACTION_DIM] = torch.tensor(next_video_chunk_sizes) / M_IN_K / M_IN_K  # mega byte  下一个chunk的各码率的大小。MB
+                state[0, 1, -1] = buffer_size / BUFFER_NORM_FACTOR  # sec  缓存时长/BUFFER_NORM_FACTOR
+                state[0, 2, -1] = float(video_chunk_size) / float(delay) / M_IN_K / BANDWIDTH_NORM_FACTOR  # MB/s 下载速度 = 当前播放chunk大小/下载耗时
+                state[0, 3, -1] = float(delay) / M_IN_K / BUFFER_NORM_FACTOR  # sec  下载耗时/BUFFER_NORM_FACTOR
+                state[0, 4, :ACTION_DIM] = torch.tensor(next_video_chunk_sizes) / M_IN_K / M_IN_K  # MB  下一个chunk的各码率的大小
                 state[0, 5, -1] = min(video_chunk_remain, CHUNK_TIL_VIDEO_END_CAP) / float(CHUNK_TIL_VIDEO_END_CAP)  # 归一化，余留chunk个数/总chunk个数
 
                 bit_rate = net.actionSelect(state)  # 选择下一个码率 INT
@@ -214,7 +219,12 @@ def agent(agent_id, all_cooked_time, all_cooked_bw, net_params_queue, exp_queue,
                 # 下载下一个选择好的码率
                 delay, sleep_time, buffer_size, rebuf, video_chunk_size, next_video_chunk_sizes, end_of_video, video_chunk_remain = net_env.get_video_chunk(bit_rate)
                 # 计算激励函数，码率 减去 卡顿惩罚系数×卡顿时长 减去 平滑惩罚系数×码率变动量
-                reward = VIDEO_BIT_RATE[bit_rate] / M_IN_K - REBUF_PENALTY * rebuf - SMOOTH_PENALTY * np.abs(VIDEO_BIT_RATE[bit_rate] - VIDEO_BIT_RATE[last_bit_rate]) / M_IN_K
+                smooth_penalty = 0
+                if bit_rate > last_bit_rate:
+                    smooth_penalty = SMOOTH_UP_PENALTY * (VIDEO_BIT_RATE[bit_rate] - VIDEO_BIT_RATE[last_bit_rate])
+                elif bit_rate < last_bit_rate:
+                    smooth_penalty = SMOOTH_DOWN_PENALTY * (VIDEO_BIT_RATE[last_bit_rate] - VIDEO_BIT_RATE[bit_rate])
+                reward = VIDEO_BIT_RATE[bit_rate] / M_IN_K - REBUF_PENALTYS[bit_rate] * rebuf - smooth_penalty / M_IN_K
 
                 state_batch.append(state)
                 bitrate_batch.append(bit_rate)
@@ -270,8 +280,7 @@ if __name__ == '__main__':
     coordinator = mp.Process(target=central_agent, args=(net_params_queues, exp_queues, arglist.model_type, barrier))
     coordinator.start()  # 先启动一个评论家进程
 
-    all_cooked_time, all_cooked_bw, _ = load_trace.load_trace(
-        TRAIN_TRACES)  # 加载网速列表
+    all_cooked_time, all_cooked_bw, _ = load_trace.load_trace(TRAIN_TRACES)  # 加载网速列表
 
     agents = []
     for i in range(NUM_AGENTS):

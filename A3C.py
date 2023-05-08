@@ -1,11 +1,9 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.distributions import Categorical
 from Network import (ActorNetwork, CriticNetwork)
 
 PATH = './results/'
-RAND_RANGE = 1000
 
 
 class A3C(object):
@@ -17,7 +15,8 @@ class A3C(object):
         # self.entropy_eps = 1e-6
         self.model_type = model_type
         self.is_central = is_central
-        self.device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = 'cpu'
+        # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # self.device = torch.device('cuda:0')
 
         print("Load module")

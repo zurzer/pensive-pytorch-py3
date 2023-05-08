@@ -6,16 +6,14 @@ BITS_IN_BYTE = 8.0
 RANDOM_SEED = 42
 # VIDEO_CHUNCK_LEN = 4000.0  # millisec, every time add this amount to buffer  固定每个分段时长
 BITRATE_LEVELS = 6  # 可选码率个数
-TOTAL_VIDEO_CHUNCK = 48  # 总分段个数
+TOTAL_VIDEO_CHUNCK = 345  # 总分段个数
 BUFFER_THRESH = 600.0 * MILLISECONDS_IN_SECOND  # millisec, max buffer limit  触发下载休眠的最大缓存量
-RESTART_BUFFER_THRESH = 100.0 * MILLISECONDS_IN_SECOND
-CDN_BUFFER_THRESH = 50.0 * MILLISECONDS_IN_SECOND
-CDN_RESTART_BUFFER_THRESH = 30.0 * MILLISECONDS_IN_SECOND
+RESTART_BUFFER_THRESH = 30.0 * MILLISECONDS_IN_SECOND
 DRAIN_BUFFER_SLEEP_TIME = 500.0  # millisec  每次休眠时长
 PIECE_DURATION_TIME = 500.0  # millisec  每次子分片视频时长，下载满500ms就能推给播放器开始播放，无需等待完整分段下载完毕
 PACKET_PAYLOAD_PORTION = 0.95  # 网速有效载荷
 LINK_RTT = 80  # millisec  连接耗时
-PACKET_SIZE = 1500  # bytes
+# PACKET_SIZE = 1500  # bytes
 NOISE_LOW = 0.9  # 下载耗时波动率下限
 NOISE_HIGH = 1.1  # 下载耗时波动率上限
 VIDEO_SIZE_FILE = './qdata/video_size_'  # 分段大小文件 BYTE
@@ -84,6 +82,7 @@ class Environment:
             if packet_payload > piece_size:
                 duration = piece_size / throughput / PACKET_PAYLOAD_PORTION  # s，实际下载耗时
                 packet_payload = piece_size
+                self.last_mahimahi_time += duration
             else:
                 self.last_mahimahi_time = self.cooked_time[self.mahimahi_ptr]  # 结束时刻
                 self.mahimahi_ptr += 1  # 进入下一个速度区间
@@ -95,8 +94,9 @@ class Environment:
                     self.last_mahimahi_time = 0
 
             video_chunk_counter_sent += packet_payload  # 下载的数据发给播放器
-            delay += duration  # s，下载耗时
-            self.last_mahimahi_time += duration
+            delay = duration  # s，下载耗时
+            if self.last_mahimahi_time > self.cooked_time[self.mahimahi_ptr]:
+                print(duration, self.last_mahimahi_time, self.cooked_time[self.mahimahi_ptr], self.cooked_time[self.mahimahi_ptr-1], packet_payload)
             assert (self.last_mahimahi_time <= self.cooked_time[self.mahimahi_ptr])
 
             delay *= MILLISECONDS_IN_SECOND
